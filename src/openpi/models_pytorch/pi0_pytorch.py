@@ -9,7 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-from openpi.models_pytorch.temporal_attention import TemporalAttentionLayer
+from openpi.models_pytorch.temporal_attention import TemporalPositionEncoding
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -117,27 +117,24 @@ class PI0Pytorch(nn.Module):
         self.num_image_tokens_per_frame = 3 * 256
 
         if self.mem_num_frames > 1:
-            paligemma_width = paligemma_config.width
-            paligemma_num_heads = paligemma_config.num_heads
-            paligemma_head_dim = paligemma_config.head_dim
             num_layers = paligemma_config.depth
-
-            self.temporal_attention_layers = nn.ModuleDict()
-            for layer_idx in range(num_layers):
-                # Insert temporal attention at layers 3, 7, 11, 15, ... (every 4th layer, 0-indexed)
-                if (layer_idx + 1) % self.mem_temporal_attention_every_n_layers == 0:
-                    self.temporal_attention_layers[str(layer_idx)] = TemporalAttentionLayer(
-                        d_model=paligemma_width,
-                        num_heads=paligemma_num_heads,
-                        head_dim=paligemma_head_dim,
-                    )
+            # Insert temporal attention at layers 3, 7, 11, 15, ... (every 4th layer, 0-indexed).
+            self.mem_temporal_layer_indices = frozenset(
+                layer_idx
+                for layer_idx in range(num_layers)
+                if (layer_idx + 1) % self.mem_temporal_attention_every_n_layers == 0
+            )
+            # Single shared non-learnable sinusoidal temporal position encoding.
+            # Per the MEM paper, temporal attention adds NO new learnable parameters;
+            # the layer's own self_attn.{q,k,v,o}_proj weights are reused at call time.
+            self.temporal_pos_enc = TemporalPositionEncoding(paligemma_config.width)
             logging.info(
-                f"MEM: Created {len(self.temporal_attention_layers)} temporal attention layers "
-                f"at layers {sorted(int(k) for k in self.temporal_attention_layers.keys())} "
-                f"for {self.mem_num_frames} frames"
+                f"MEM: Temporal attention enabled at layers {sorted(self.mem_temporal_layer_indices)} "
+                f"for {self.mem_num_frames} frames (reusing PaliGemma projections, no new params)"
             )
         else:
-            self.temporal_attention_layers = None
+            self.mem_temporal_layer_indices = frozenset()
+            self.temporal_pos_enc = None
 
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
@@ -408,11 +405,11 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
-                temporal_attention_layers=self.temporal_attention_layers,
+                mem_temporal_layer_indices=self.mem_temporal_layer_indices,
+                temporal_pos_enc=self.temporal_pos_enc,
                 num_image_tokens_per_frame=self.num_image_tokens_per_frame,
                 mem_num_frames=self.mem_num_frames,
                 mem_frame_interval=self.mem_frame_interval,
-                mem_temporal_attention_every_n_layers=self.mem_temporal_attention_every_n_layers,
             )
             return suffix_out
 
@@ -455,11 +452,11 @@ class PI0Pytorch(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
-            temporal_attention_layers=self.temporal_attention_layers,
+            mem_temporal_layer_indices=self.mem_temporal_layer_indices,
+            temporal_pos_enc=self.temporal_pos_enc,
             num_image_tokens_per_frame=self.num_image_tokens_per_frame,
             mem_num_frames=self.mem_num_frames,
             mem_frame_interval=self.mem_frame_interval,
-            mem_temporal_attention_every_n_layers=self.mem_temporal_attention_every_n_layers,
         )
 
         dt = -1.0 / num_steps

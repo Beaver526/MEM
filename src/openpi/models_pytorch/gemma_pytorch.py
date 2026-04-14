@@ -8,6 +8,8 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from openpi.models_pytorch.temporal_attention import apply_temporal_attention
+
 
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
@@ -96,16 +98,17 @@ class PaliGemmaWithExpertModel(nn.Module):
         past_key_values,
         use_cache,
         adarms_cond,
-        temporal_attention_layers,
+        mem_temporal_layer_indices,
+        temporal_pos_enc,
         num_image_tokens_per_frame,
         mem_num_frames,
         mem_frame_interval,
-        mem_temporal_attention_every_n_layers,
     ):
         """Custom prefix-only forward path with temporal attention for MEM inference.
 
         Manually iterates through PaliGemma language model layers, injecting temporal
-        attention at designated layers, and builds KV cache for inference.
+        attention at designated layers (reusing each layer's own Q/K/V/O projections),
+        and builds KV cache for inference.
         """
         from transformers.cache_utils import DynamicCache
 
@@ -143,15 +146,22 @@ class PaliGemmaWithExpertModel(nn.Module):
             )
             hidden_states = modeling_gemma._gated_residual(residual, hidden_states, gate)  # noqa: SLF001
 
-            # MEM: Apply temporal attention at designated layers
-            if (
-                temporal_attention_layers is not None
-                and mem_num_frames > 1
-                and (layer_idx + 1) % mem_temporal_attention_every_n_layers == 0
-                and str(layer_idx) in temporal_attention_layers
-            ):
-                hidden_states = temporal_attention_layers[str(layer_idx)](
-                    hidden_states, num_image_tokens_per_frame, mem_num_frames, mem_frame_interval
+            # MEM: Apply factorized temporal attention, reusing this layer's own projections.
+            if mem_num_frames > 1 and layer_idx in mem_temporal_layer_indices:
+                spatial_self_attn = decoder_layer.self_attn
+                hidden_states = apply_temporal_attention(
+                    hidden_states=hidden_states,
+                    q_proj=spatial_self_attn.q_proj,
+                    k_proj=spatial_self_attn.k_proj,
+                    v_proj=spatial_self_attn.v_proj,
+                    o_proj=spatial_self_attn.o_proj,
+                    temporal_pos_enc=temporal_pos_enc,
+                    num_image_tokens_per_frame=num_image_tokens_per_frame,
+                    num_frames=mem_num_frames,
+                    frame_interval=mem_frame_interval,
+                    num_heads=spatial_self_attn.config.num_attention_heads,
+                    num_kv_heads=spatial_self_attn.config.num_key_value_heads,
+                    head_dim=spatial_self_attn.head_dim,
                 )
 
             # MLP
@@ -175,16 +185,18 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
-        temporal_attention_layers: torch.nn.ModuleDict | None = None,
+        mem_temporal_layer_indices: frozenset[int] | set[int] | None = None,
+        temporal_pos_enc: torch.nn.Module | None = None,
         num_image_tokens_per_frame: int = 0,
         mem_num_frames: int = 1,
         mem_frame_interval: float = 0.5,
-        mem_temporal_attention_every_n_layers: int = 4,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
+        if mem_temporal_layer_indices is None:
+            mem_temporal_layer_indices = frozenset()
         if inputs_embeds[1] is None:
-            if temporal_attention_layers is not None and mem_num_frames > 1:
+            if mem_num_frames > 1 and len(mem_temporal_layer_indices) > 0:
                 # Custom prefix-only path with temporal attention for MEM inference
                 prefix_output, prefix_past_key_values = self._forward_prefix_with_temporal_attention(
                     inputs_embeds=inputs_embeds[0],
@@ -193,11 +205,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                     past_key_values=past_key_values,
                     use_cache=use_cache,
                     adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
-                    temporal_attention_layers=temporal_attention_layers,
+                    mem_temporal_layer_indices=mem_temporal_layer_indices,
+                    temporal_pos_enc=temporal_pos_enc,
                     num_image_tokens_per_frame=num_image_tokens_per_frame,
                     mem_num_frames=mem_num_frames,
                     mem_frame_interval=mem_frame_interval,
-                    mem_temporal_attention_every_n_layers=mem_temporal_attention_every_n_layers,
                 )
             else:
                 prefix_output = self.paligemma.language_model.forward(
@@ -255,11 +267,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                 self._debug_gc_printed = True
 
             # Capture temporal attention params in closure for compute_layer_complete
-            _temporal_attention_layers = temporal_attention_layers
+            _mem_temporal_layer_indices = mem_temporal_layer_indices
+            _temporal_pos_enc = temporal_pos_enc
             _num_image_tokens_per_frame = num_image_tokens_per_frame
             _mem_num_frames = mem_num_frames
             _mem_frame_interval = mem_frame_interval
-            _mem_temporal_attention_every_n_layers = mem_temporal_attention_every_n_layers
 
             # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
@@ -331,16 +343,26 @@ class PaliGemmaWithExpertModel(nn.Module):
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
 
-                    # MEM: Apply temporal attention after spatial attention for prefix expert
+                    # MEM: Apply factorized temporal attention, reusing this layer's own projections.
                     if (
                         i == 0
-                        and _temporal_attention_layers is not None
                         and _mem_num_frames > 1
-                        and (layer_idx + 1) % _mem_temporal_attention_every_n_layers == 0
-                        and str(layer_idx) in _temporal_attention_layers
+                        and layer_idx in _mem_temporal_layer_indices
                     ):
-                        out_emb = _temporal_attention_layers[str(layer_idx)](
-                            out_emb, _num_image_tokens_per_frame, _mem_num_frames, _mem_frame_interval
+                        spatial_self_attn = self.paligemma.language_model.layers[layer_idx].self_attn
+                        out_emb = apply_temporal_attention(
+                            hidden_states=out_emb,
+                            q_proj=spatial_self_attn.q_proj,
+                            k_proj=spatial_self_attn.k_proj,
+                            v_proj=spatial_self_attn.v_proj,
+                            o_proj=spatial_self_attn.o_proj,
+                            temporal_pos_enc=_temporal_pos_enc,
+                            num_image_tokens_per_frame=_num_image_tokens_per_frame,
+                            num_frames=_mem_num_frames,
+                            frame_interval=_mem_frame_interval,
+                            num_heads=spatial_self_attn.config.num_attention_heads,
+                            num_kv_heads=spatial_self_attn.config.num_key_value_heads,
+                            head_dim=spatial_self_attn.head_dim,
                         )
 
                     after_first_residual = out_emb.clone()
