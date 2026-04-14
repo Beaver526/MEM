@@ -146,11 +146,12 @@ class PaliGemmaWithExpertModel(nn.Module):
             )
             hidden_states = modeling_gemma._gated_residual(residual, hidden_states, gate)  # noqa: SLF001
 
-            # MEM: Apply factorized temporal attention, reusing this layer's own projections.
+            # MEM: Apply factorized temporal attention, reusing this layer's own LN + projections.
             if mem_num_frames > 1 and layer_idx in mem_temporal_layer_indices:
                 spatial_self_attn = decoder_layer.self_attn
                 hidden_states = apply_temporal_attention(
                     hidden_states=hidden_states,
+                    input_layernorm=decoder_layer.input_layernorm,
                     q_proj=spatial_self_attn.q_proj,
                     k_proj=spatial_self_attn.k_proj,
                     v_proj=spatial_self_attn.v_proj,
@@ -343,15 +344,17 @@ class PaliGemmaWithExpertModel(nn.Module):
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
 
-                    # MEM: Apply factorized temporal attention, reusing this layer's own projections.
+                    # MEM: Apply factorized temporal attention, reusing this layer's LN + projections.
                     if (
                         i == 0
                         and _mem_num_frames > 1
                         and layer_idx in _mem_temporal_layer_indices
                     ):
-                        spatial_self_attn = self.paligemma.language_model.layers[layer_idx].self_attn
+                        prefix_layer = self.paligemma.language_model.layers[layer_idx]
+                        spatial_self_attn = prefix_layer.self_attn
                         out_emb = apply_temporal_attention(
                             hidden_states=out_emb,
+                            input_layernorm=prefix_layer.input_layernorm,
                             q_proj=spatial_self_attn.q_proj,
                             k_proj=spatial_self_attn.k_proj,
                             v_proj=spatial_self_attn.v_proj,

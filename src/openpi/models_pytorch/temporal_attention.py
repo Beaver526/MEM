@@ -60,6 +60,7 @@ class TemporalPositionEncoding(nn.Module):
 
 def apply_temporal_attention(
     hidden_states: Tensor,
+    input_layernorm: nn.Module,
     q_proj: nn.Linear,
     k_proj: nn.Linear,
     v_proj: nn.Linear,
@@ -72,14 +73,17 @@ def apply_temporal_attention(
     num_kv_heads: int,
     head_dim: int,
 ) -> Tensor:
-    """Factorized temporal attention that reuses the hosting layer's projections.
+    """Factorized temporal attention that reuses the hosting layer's LN + projections.
 
     Applies causal self-attention across the temporal dimension for image tokens,
     with each spatial position attended independently. Non-image tokens pass through
-    unchanged. Introduces NO new learnable parameters.
+    unchanged. Introduces NO new learnable parameters: the hosting layer's own
+    ``input_layernorm`` (shared γ/β with spatial attention) and ``self_attn.{q,k,v,o}_proj``
+    weights are reused.
 
     Args:
         hidden_states: ``[B, seq_len, D]`` prefix embeddings (image tokens first, frame-major).
+        input_layernorm: the hosting PaliGemma layer's pre-attention norm (reused).
         q_proj, k_proj, v_proj, o_proj: the hosting PaliGemma layer's existing projections.
         temporal_pos_enc: shared (non-learnable) sinusoidal position encoding module.
         num_image_tokens_per_frame: S (e.g. 768 = 3 cameras * 256 patches).
@@ -99,11 +103,15 @@ def apply_temporal_attention(
 
     img_tokens = hidden_states[:, :num_img_total, :]  # [B, N*S, D], frame-major
     other_tokens = hidden_states[:, num_img_total:, :]  # [B, rest, D]
-    img_residual = img_tokens
+    img_residual = img_tokens  # residual on the UN-normalized tensor (pre-norm Transformer pattern)
+
+    # Reuse hosting layer's input_layernorm (shared γ/β with spatial attention).
+    # PaliGemma prefix has use_adarms=False, so cond=None and the returned gate is unused here.
+    img_tokens, _gate = input_layernorm(img_tokens, cond=None)
 
     # [B, N*S, D] -> [B, N, S, D]; add temporal pos enc; -> [B*S, N, D]
     img_tokens = img_tokens.view(B, N, S, D)
-    pos_enc = temporal_pos_enc(N, frame_interval, hidden_states.device, hidden_states.dtype)
+    pos_enc = temporal_pos_enc(N, frame_interval, hidden_states.device, img_tokens.dtype)
     img_tokens = img_tokens + pos_enc  # broadcasts over B and S
     img_tokens = img_tokens.permute(0, 2, 1, 3).reshape(B * S, N, D)
 
