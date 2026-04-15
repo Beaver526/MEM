@@ -48,10 +48,13 @@ import openpi.training.data_loader as _data
 
 
 def expand_observation_with_dummy_frames(observation, num_frames: int):
-    """Expand single-frame observation to multi-frame by adding dummy past frames.
+    """Expand single-frame observation to multi-frame by replicating the current frame.
 
-    Current frame becomes the last frame (index N-1). Past frames (indices 0..N-2)
-    are filled with zeros. Image masks for dummy frames are set to False.
+    The current frame is replicated across all N frame slots (including the past-frame
+    slots at indices 0..N-2 and the current-frame slot at index N-1). This keeps the
+    inputs in-distribution for the vision encoder (unlike zero-padding), while still
+    matching the [B, N, ...] shape required by the MEM multi-frame pipeline. Image
+    masks are replicated from the current mask.
 
     Args:
         observation: Observation object with .images dict (values: [B, C, H, W] or [B, H, W, C])
@@ -64,25 +67,16 @@ def expand_observation_with_dummy_frames(observation, num_frames: int):
     if num_frames <= 1:
         return observation
 
-    # Expand images: [B, C, H, W] -> [B, N, C, H, W]
+    # Expand images: [B, C, H, W] -> [B, N, C, H, W] by replicating the current frame.
     new_images = {}
     for key, img in observation.images.items():
-        B = img.shape[0]
-        # Create dummy past frames (zeros)
-        dummy_frames = torch.zeros(B, num_frames - 1, *img.shape[1:], dtype=img.dtype, device=img.device)
-        # Current frame at last position
-        current_frame = img.unsqueeze(1)  # [B, 1, C, H, W]
-        # Concatenate: [dummy_past_frames | current_frame]
-        new_images[key] = torch.cat([dummy_frames, current_frame], dim=1)  # [B, N, C, H, W]
+        repeat_shape = [1, num_frames, *([1] * (img.ndim - 1))]
+        new_images[key] = img.unsqueeze(1).repeat(*repeat_shape)  # [B, N, C, H, W]
 
-    # Expand image masks: [B] -> [B, N]
+    # Expand image masks: [B] -> [B, N] by replicating the current mask.
     new_masks = {}
     for key, mask in observation.image_masks.items():
-        B = mask.shape[0]
-        # Dummy past frames are masked out (False), current frame keeps original mask
-        dummy_masks = torch.zeros(B, num_frames - 1, dtype=torch.bool, device=mask.device)
-        current_mask = mask.unsqueeze(1)  # [B, 1]
-        new_masks[key] = torch.cat([dummy_masks, current_mask], dim=1)  # [B, N]
+        new_masks[key] = mask.unsqueeze(1).repeat(1, num_frames)  # [B, N]
 
     observation.images = new_images
     observation.image_masks = new_masks
