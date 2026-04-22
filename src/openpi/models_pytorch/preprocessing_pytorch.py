@@ -37,6 +37,13 @@ def preprocess_observation_pytorch(
     for key in image_keys:
         image = observation.images[key]
 
+        # Handle multi-frame images [B, N, C, H, W] or [B, N, H, W, C]:
+        # Merge frame dim into batch, preprocess as 4D, then restore.
+        num_frames = None
+        if image.ndim == 5:
+            B, num_frames = image.shape[:2]
+            image = image.reshape(B * num_frames, *image.shape[2:])  # [B*N, C, H, W] or [B*N, H, W, C]
+
         # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
         # Handle both [B, C, H, W] and [B, H, W, C] formats
         is_channels_first = image.shape[1] == 3  # Check if channels are in dimension 1
@@ -144,6 +151,10 @@ def preprocess_observation_pytorch(
         # Convert back to [B, C, H, W] format if it was originally channels-first
         if is_channels_first:
             image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+
+        # Restore frame dimension if it was merged into batch.
+        if num_frames is not None:
+            image = image.reshape(B, num_frames, *image.shape[1:])  # [B, N, C, H, W]
 
         out_images[key] = image
 

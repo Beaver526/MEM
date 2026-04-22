@@ -9,6 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.temporal_attention import TemporalPositionEncoding
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -108,6 +109,32 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # MEM temporal attention setup — temporal attention lives in SigLIP ViT (per MEM paper).
+        self.mem_num_frames = config.mem_num_frames
+        self.mem_frame_interval = config.mem_frame_interval
+        self.mem_temporal_attention_every_n_layers = config.mem_temporal_attention_every_n_layers
+
+        if self.mem_num_frames > 1:
+            siglip_encoder = self.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder
+            siglip_config = siglip_encoder.config
+            num_layers = siglip_config.num_hidden_layers
+            mem_temporal_layer_indices = frozenset(
+                layer_idx
+                for layer_idx in range(num_layers)
+                if (layer_idx + 1) % self.mem_temporal_attention_every_n_layers == 0
+            )
+            self.temporal_pos_enc = TemporalPositionEncoding(siglip_config.hidden_size)
+            siglip_encoder.mem_temporal_layer_indices = mem_temporal_layer_indices
+            siglip_encoder.temporal_pos_enc = self.temporal_pos_enc
+            siglip_encoder.mem_frame_interval = self.mem_frame_interval
+            siglip_encoder._mem_active_num_frames = 1
+            logging.info(
+                f"MEM: Temporal attention enabled at SigLIP layers {sorted(mem_temporal_layer_indices)} "
+                f"for {self.mem_num_frames} frames (reusing SigLIP projections, no new params)"
+            )
+        else:
+            self.temporal_pos_enc = None
+
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
@@ -189,26 +216,56 @@ class PI0Pytorch(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
+
+        For MEM multi-frame mode, images have shape [B, N, ...] and are arranged in
+        frame-major order: [frame0_cam0, frame0_cam1, frame0_cam2, frame1_cam0, ...].
         """
         embs = []
         pad_masks = []
         att_masks = []
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        is_multiframe = self.mem_num_frames > 1 and images[0].ndim == 5
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+        if is_multiframe:
+            # Multi-frame: images are [B, N, C, H, W] or [B, N, H, W, C].
+            # Batch all N frames per camera through SigLIP; temporal attention runs inside the encoder.
+            N = self.mem_num_frames
+            siglip_encoder = self.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder
+            siglip_encoder._mem_active_num_frames = N
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+            for img, img_mask in zip(images, img_masks, strict=True):
+                B = img.shape[0]
+                img_flat = img.reshape(B * N, *img.shape[2:])  # [B*N, C, H, W]
 
-            bsize, num_img_embs = img_emb.shape[:2]
+                def image_embed_func(img_flat):
+                    return self.paligemma_with_expert.embed_image(img_flat)
 
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+                img_emb = self._apply_checkpoint(image_embed_func, img_flat)  # [B*N, S, D_proj]
+                num_patches = img_emb.shape[1]
+                img_emb = img_emb.reshape(B, N * num_patches, img_emb.shape[-1])  # [B, N*S, D_proj]
 
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
+                embs.append(img_emb)
+                if img_mask.ndim == 2:  # [B, N]
+                    cam_mask = img_mask.unsqueeze(-1).expand(B, N, num_patches).reshape(B, N * num_patches)
+                else:  # [B]
+                    cam_mask = img_mask.unsqueeze(-1).expand(B, N * num_patches)
+                pad_masks.append(cam_mask)
+                att_masks += [0] * (N * num_patches)
+
+            siglip_encoder._mem_active_num_frames = 1
+        else:
+            # Single-frame: original path
+            for img, img_mask in zip(images, img_masks, strict=True):
+
+                def image_embed_func(img):
+                    return self.paligemma_with_expert.embed_image(img)
+
+                img_emb = self._apply_checkpoint(image_embed_func, img)
+                bsize, num_img_embs = img_emb.shape[:2]
+
+                embs.append(img_emb)
+                pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+                att_masks += [0] * num_img_embs
 
         # Process language tokens
         def lang_embed_func(lang_tokens):

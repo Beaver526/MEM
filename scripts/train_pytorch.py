@@ -47,6 +47,42 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
 
+def expand_observation_with_dummy_frames(observation, num_frames: int):
+    """Expand single-frame observation to multi-frame by replicating the current frame.
+
+    The current frame is replicated across all N frame slots (including the past-frame
+    slots at indices 0..N-2 and the current-frame slot at index N-1). This keeps the
+    inputs in-distribution for the vision encoder (unlike zero-padding), while still
+    matching the [B, N, ...] shape required by the MEM multi-frame pipeline. Image
+    masks are replicated from the current mask.
+
+    Args:
+        observation: Observation object with .images dict (values: [B, C, H, W] or [B, H, W, C])
+                     and .image_masks dict (values: [B] bool).
+        num_frames: Total number of frames N.
+
+    Returns:
+        Modified observation with images [B, N, ...] and image_masks [B, N].
+    """
+    if num_frames <= 1:
+        return observation
+
+    # Expand images: [B, C, H, W] -> [B, N, C, H, W] by replicating the current frame.
+    new_images = {}
+    for key, img in observation.images.items():
+        repeat_shape = [1, num_frames, *([1] * (img.ndim - 1))]
+        new_images[key] = img.unsqueeze(1).repeat(*repeat_shape)  # [B, N, C, H, W]
+
+    # Expand image masks: [B] -> [B, N] by replicating the current mask.
+    new_masks = {}
+    for key, mask in observation.image_masks.items():
+        new_masks[key] = mask.unsqueeze(1).repeat(1, num_frames)  # [B, N]
+
+    observation.images = new_images
+    observation.image_masks = new_masks
+    return observation
+
+
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
 
@@ -400,6 +436,9 @@ def train_loop(config: _config.TrainConfig):
             paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
+            mem_num_frames=getattr(config.model, "mem_num_frames", 1),
+            mem_frame_interval=getattr(config.model, "mem_frame_interval", 0.5),
+            mem_temporal_attention_every_n_layers=getattr(config.model, "mem_temporal_attention_every_n_layers", 4),
         )
     else:
         model_cfg = config.model
@@ -520,6 +559,10 @@ def train_loop(config: _config.TrainConfig):
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
+
+            # MEM: Expand single-frame observation to multi-frame with dummy past frames
+            if model_cfg.mem_num_frames > 1:
+                observation = expand_observation_with_dummy_frames(observation, model_cfg.mem_num_frames)  # noqa: PLW2901
 
             # Update LR
             for pg in optim.param_groups:
