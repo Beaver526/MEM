@@ -8,8 +8,6 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
-from openpi.models_pytorch.temporal_attention import apply_temporal_attention
-
 
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
@@ -90,94 +88,6 @@ class PaliGemmaWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
-    def _forward_prefix_with_temporal_attention(
-        self,
-        inputs_embeds,
-        attention_mask,
-        position_ids,
-        past_key_values,
-        use_cache,
-        adarms_cond,
-        mem_temporal_layer_indices,
-        temporal_pos_enc,
-        num_image_tokens_per_frame,
-        mem_num_frames,
-        mem_frame_interval,
-    ):
-        """Custom prefix-only forward path with temporal attention for MEM inference.
-
-        Manually iterates through PaliGemma language model layers, injecting temporal
-        attention at designated layers (reusing each layer's own Q/K/V/O projections),
-        and builds KV cache for inference.
-        """
-        from transformers.cache_utils import DynamicCache
-
-        lang_model = self.paligemma.language_model
-        hidden_states = inputs_embeds
-
-        # Convert to bfloat16 if needed
-        if len(lang_model.layers) > 0 and lang_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(torch.bfloat16)
-
-        # Create position embeddings (RoPE)
-        position_embeddings = lang_model.rotary_emb(hidden_states, position_ids)
-
-        # Create KV cache
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
-
-        # Prepare causal mask
-        causal_mask = attention_mask
-
-        # Process through layers
-        for layer_idx, decoder_layer in enumerate(lang_model.layers):
-            # Standard transformer layer forward
-            residual = hidden_states
-            hidden_states, gate = decoder_layer.input_layernorm(hidden_states, cond=adarms_cond)
-
-            # Self attention
-            hidden_states, _ = decoder_layer.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values,
-                use_cache=use_cache,
-                position_embeddings=position_embeddings,
-            )
-            hidden_states = modeling_gemma._gated_residual(residual, hidden_states, gate)  # noqa: SLF001
-
-            # MEM: Apply factorized temporal attention, reusing this layer's own LN + projections.
-            if mem_num_frames > 1 and layer_idx in mem_temporal_layer_indices:
-                spatial_self_attn = decoder_layer.self_attn
-                hidden_states = apply_temporal_attention(
-                    hidden_states=hidden_states,
-                    input_layernorm=decoder_layer.input_layernorm,
-                    q_proj=spatial_self_attn.q_proj,
-                    k_proj=spatial_self_attn.k_proj,
-                    v_proj=spatial_self_attn.v_proj,
-                    o_proj=spatial_self_attn.o_proj,
-                    temporal_pos_enc=temporal_pos_enc,
-                    num_image_tokens_per_frame=num_image_tokens_per_frame,
-                    num_frames=mem_num_frames,
-                    frame_interval=mem_frame_interval,
-                    num_heads=spatial_self_attn.config.num_attention_heads,
-                    num_kv_heads=spatial_self_attn.config.num_key_value_heads,
-                    head_dim=spatial_self_attn.head_dim,
-                )
-
-            # MLP
-            residual = hidden_states
-            hidden_states, gate = decoder_layer.post_attention_layernorm(hidden_states, cond=adarms_cond)
-            if decoder_layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                hidden_states = hidden_states.to(dtype=torch.bfloat16)
-            hidden_states = decoder_layer.mlp(hidden_states)
-            hidden_states = modeling_gemma._gated_residual(residual, hidden_states, gate)  # noqa: SLF001
-
-        # Final norm
-        hidden_states, _ = lang_model.norm(hidden_states, cond=adarms_cond)
-
-        return hidden_states, past_key_values
-
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -186,43 +96,20 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
-        mem_temporal_layer_indices: frozenset[int] | set[int] | None = None,
-        temporal_pos_enc: torch.nn.Module | None = None,
-        num_image_tokens_per_frame: int = 0,
-        mem_num_frames: int = 1,
-        mem_frame_interval: float = 0.5,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
-        if mem_temporal_layer_indices is None:
-            mem_temporal_layer_indices = frozenset()
         if inputs_embeds[1] is None:
-            if mem_num_frames > 1 and len(mem_temporal_layer_indices) > 0:
-                # Custom prefix-only path with temporal attention for MEM inference
-                prefix_output, prefix_past_key_values = self._forward_prefix_with_temporal_attention(
-                    inputs_embeds=inputs_embeds[0],
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
-                    mem_temporal_layer_indices=mem_temporal_layer_indices,
-                    temporal_pos_enc=temporal_pos_enc,
-                    num_image_tokens_per_frame=num_image_tokens_per_frame,
-                    mem_num_frames=mem_num_frames,
-                    mem_frame_interval=mem_frame_interval,
-                )
-            else:
-                prefix_output = self.paligemma.language_model.forward(
-                    inputs_embeds=inputs_embeds[0],
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
-                )
-                prefix_past_key_values = prefix_output.past_key_values
-                prefix_output = prefix_output.last_hidden_state
+            prefix_output = self.paligemma.language_model.forward(
+                inputs_embeds=inputs_embeds[0],
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+            )
+            prefix_past_key_values = prefix_output.past_key_values
+            prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
             suffix_output = self.gemma_expert.model.forward(
@@ -266,13 +153,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                         f"Gemma expert model gradient_checkpointing value: {self.gemma_expert.model.gradient_checkpointing}"
                     )
                 self._debug_gc_printed = True
-
-            # Capture temporal attention params in closure for compute_layer_complete
-            _mem_temporal_layer_indices = mem_temporal_layer_indices
-            _temporal_pos_enc = temporal_pos_enc
-            _num_image_tokens_per_frame = num_image_tokens_per_frame
-            _mem_num_frames = mem_num_frames
-            _mem_frame_interval = mem_frame_interval
 
             # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
@@ -343,30 +223,6 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
-
-                    # MEM: Apply factorized temporal attention, reusing this layer's LN + projections.
-                    if (
-                        i == 0
-                        and _mem_num_frames > 1
-                        and layer_idx in _mem_temporal_layer_indices
-                    ):
-                        prefix_layer = self.paligemma.language_model.layers[layer_idx]
-                        spatial_self_attn = prefix_layer.self_attn
-                        out_emb = apply_temporal_attention(
-                            hidden_states=out_emb,
-                            input_layernorm=prefix_layer.input_layernorm,
-                            q_proj=spatial_self_attn.q_proj,
-                            k_proj=spatial_self_attn.k_proj,
-                            v_proj=spatial_self_attn.v_proj,
-                            o_proj=spatial_self_attn.o_proj,
-                            temporal_pos_enc=_temporal_pos_enc,
-                            num_image_tokens_per_frame=_num_image_tokens_per_frame,
-                            num_frames=_mem_num_frames,
-                            frame_interval=_mem_frame_interval,
-                            num_heads=spatial_self_attn.config.num_attention_heads,
-                            num_kv_heads=spatial_self_attn.config.num_key_value_heads,
-                            head_dim=spatial_self_attn.head_dim,
-                        )
 
                     after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])

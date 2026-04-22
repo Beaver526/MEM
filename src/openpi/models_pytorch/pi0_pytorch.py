@@ -109,31 +109,30 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # MEM temporal attention setup
+        # MEM temporal attention setup — temporal attention lives in SigLIP ViT (per MEM paper).
         self.mem_num_frames = config.mem_num_frames
         self.mem_frame_interval = config.mem_frame_interval
         self.mem_temporal_attention_every_n_layers = config.mem_temporal_attention_every_n_layers
-        # 3 cameras * 256 patches each = 768 image tokens per frame
-        self.num_image_tokens_per_frame = 3 * 256
 
         if self.mem_num_frames > 1:
-            num_layers = paligemma_config.depth
-            # Insert temporal attention at layers 3, 7, 11, 15, ... (every 4th layer, 0-indexed).
-            self.mem_temporal_layer_indices = frozenset(
+            siglip_encoder = self.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder
+            siglip_config = siglip_encoder.config
+            num_layers = siglip_config.num_hidden_layers
+            mem_temporal_layer_indices = frozenset(
                 layer_idx
                 for layer_idx in range(num_layers)
                 if (layer_idx + 1) % self.mem_temporal_attention_every_n_layers == 0
             )
-            # Single shared non-learnable sinusoidal temporal position encoding.
-            # Per the MEM paper, temporal attention adds NO new learnable parameters;
-            # the layer's own self_attn.{q,k,v,o}_proj weights are reused at call time.
-            self.temporal_pos_enc = TemporalPositionEncoding(paligemma_config.width)
+            self.temporal_pos_enc = TemporalPositionEncoding(siglip_config.hidden_size)
+            siglip_encoder.mem_temporal_layer_indices = mem_temporal_layer_indices
+            siglip_encoder.temporal_pos_enc = self.temporal_pos_enc
+            siglip_encoder.mem_frame_interval = self.mem_frame_interval
+            siglip_encoder._mem_active_num_frames = 1
             logging.info(
-                f"MEM: Temporal attention enabled at layers {sorted(self.mem_temporal_layer_indices)} "
-                f"for {self.mem_num_frames} frames (reusing PaliGemma projections, no new params)"
+                f"MEM: Temporal attention enabled at SigLIP layers {sorted(mem_temporal_layer_indices)} "
+                f"for {self.mem_num_frames} frames (reusing SigLIP projections, no new params)"
             )
         else:
-            self.mem_temporal_layer_indices = frozenset()
             self.temporal_pos_enc = None
 
         torch.set_float32_matmul_precision("high")
@@ -228,24 +227,32 @@ class PI0Pytorch(nn.Module):
         is_multiframe = self.mem_num_frames > 1 and images[0].ndim == 5
 
         if is_multiframe:
-            # Multi-frame: images are [B, N, H, W, C] or [B, N, C, H, W]
+            # Multi-frame: images are [B, N, C, H, W] or [B, N, H, W, C].
+            # Batch all N frames per camera through SigLIP; temporal attention runs inside the encoder.
             N = self.mem_num_frames
-            # Process frame-by-frame, all cameras per frame, to get frame-major token ordering
-            for frame_idx in range(N):
-                for img, img_mask in zip(images, img_masks, strict=True):
-                    frame_img = img[:, frame_idx]  # [B, H, W, C] or [B, C, H, W]
-                    # img_mask is [B, N] for multi-frame; extract per-frame mask
-                    frame_mask = img_mask[:, frame_idx] if img_mask.ndim == 2 else img_mask  # [B]
+            siglip_encoder = self.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder
+            siglip_encoder._mem_active_num_frames = N
 
-                    def image_embed_func(frame_img):
-                        return self.paligemma_with_expert.embed_image(frame_img)
+            for img, img_mask in zip(images, img_masks, strict=True):
+                B = img.shape[0]
+                img_flat = img.reshape(B * N, *img.shape[2:])  # [B*N, C, H, W]
 
-                    img_emb = self._apply_checkpoint(image_embed_func, frame_img)
-                    bsize, num_img_embs = img_emb.shape[:2]
+                def image_embed_func(img_flat):
+                    return self.paligemma_with_expert.embed_image(img_flat)
 
-                    embs.append(img_emb)
-                    pad_masks.append(frame_mask[:, None].expand(bsize, num_img_embs))
-                    att_masks += [0] * num_img_embs
+                img_emb = self._apply_checkpoint(image_embed_func, img_flat)  # [B*N, S, D_proj]
+                num_patches = img_emb.shape[1]
+                img_emb = img_emb.reshape(B, N * num_patches, img_emb.shape[-1])  # [B, N*S, D_proj]
+
+                embs.append(img_emb)
+                if img_mask.ndim == 2:  # [B, N]
+                    cam_mask = img_mask.unsqueeze(-1).expand(B, N, num_patches).reshape(B, N * num_patches)
+                else:  # [B]
+                    cam_mask = img_mask.unsqueeze(-1).expand(B, N * num_patches)
+                pad_masks.append(cam_mask)
+                att_masks += [0] * (N * num_patches)
+
+            siglip_encoder._mem_active_num_frames = 1
         else:
             # Single-frame: original path
             for img, img_mask in zip(images, img_masks, strict=True):
@@ -405,11 +412,6 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
-                mem_temporal_layer_indices=self.mem_temporal_layer_indices,
-                temporal_pos_enc=self.temporal_pos_enc,
-                num_image_tokens_per_frame=self.num_image_tokens_per_frame,
-                mem_num_frames=self.mem_num_frames,
-                mem_frame_interval=self.mem_frame_interval,
             )
             return suffix_out
 
@@ -452,11 +454,6 @@ class PI0Pytorch(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
-            mem_temporal_layer_indices=self.mem_temporal_layer_indices,
-            temporal_pos_enc=self.temporal_pos_enc,
-            num_image_tokens_per_frame=self.num_image_tokens_per_frame,
-            mem_num_frames=self.mem_num_frames,
-            mem_frame_interval=self.mem_frame_interval,
         )
 
         dt = -1.0 / num_steps

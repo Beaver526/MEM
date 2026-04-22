@@ -600,8 +600,15 @@ class SiglipEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
+        # MEM: read temporal attention config from instance attributes (set by PI0Pytorch)
+        _mem_num_frames = getattr(self, '_mem_active_num_frames', 1)
+        _mem_temporal_layer_indices = getattr(self, 'mem_temporal_layer_indices', None)
+        _temporal_pos_enc = getattr(self, 'temporal_pos_enc', None)
+        _mem_frame_interval = getattr(self, 'mem_frame_interval', 0.5)
+        _mem_active = _mem_num_frames > 1 and _mem_temporal_layer_indices is not None
+
         hidden_states = inputs_embeds
-        for encoder_layer in self.layers:
+        for layer_idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
@@ -612,6 +619,31 @@ class SiglipEncoder(nn.Module):
             )
 
             hidden_states = layer_outputs[0]
+
+            # MEM: Apply temporal attention at designated layers.
+            # hidden_states is [B*N, S, D]; reshape to [B, N*S, D] for temporal attention.
+            if _mem_active and layer_idx in _mem_temporal_layer_indices:
+                from openpi.models_pytorch.temporal_attention import apply_temporal_attention
+
+                BN, S_tok, D = hidden_states.shape
+                B = BN // _mem_num_frames
+                hidden_states = hidden_states.view(B, _mem_num_frames * S_tok, D)
+                hidden_states = apply_temporal_attention(
+                    hidden_states=hidden_states,
+                    input_layernorm=encoder_layer.layer_norm1,
+                    q_proj=encoder_layer.self_attn.q_proj,
+                    k_proj=encoder_layer.self_attn.k_proj,
+                    v_proj=encoder_layer.self_attn.v_proj,
+                    o_proj=encoder_layer.self_attn.out_proj,
+                    temporal_pos_enc=_temporal_pos_enc,
+                    num_image_tokens_per_frame=S_tok,
+                    num_frames=_mem_num_frames,
+                    frame_interval=_mem_frame_interval,
+                    num_heads=encoder_layer.self_attn.num_heads,
+                    num_kv_heads=encoder_layer.self_attn.num_heads,
+                    head_dim=encoder_layer.self_attn.head_dim,
+                )
+                hidden_states = hidden_states.view(BN, S_tok, D)
 
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)

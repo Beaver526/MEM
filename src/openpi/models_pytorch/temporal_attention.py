@@ -106,18 +106,23 @@ def apply_temporal_attention(
     img_residual = img_tokens  # residual on the UN-normalized tensor (pre-norm Transformer pattern)
 
     # Reuse hosting layer's input_layernorm (shared γ/β with spatial attention).
-    # PaliGemma prefix has use_adarms=False, so cond=None and the returned gate is unused here.
-    img_tokens, _gate = input_layernorm(img_tokens, cond=None)
+    # Supports both standard nn.LayerNorm (SigLIP) and Gemma's RMSNorm (with cond kwarg).
+    try:
+        img_tokens_normed = input_layernorm(img_tokens, cond=None)
+        if isinstance(img_tokens_normed, tuple):
+            img_tokens_normed = img_tokens_normed[0]
+    except TypeError:
+        img_tokens_normed = input_layernorm(img_tokens)
 
     # [B, N*S, D] -> [B, N, S, D]; add temporal pos enc; -> [B*S, N, D]
-    img_tokens = img_tokens.view(B, N, S, D)
-    pos_enc = temporal_pos_enc(N, frame_interval, hidden_states.device, img_tokens.dtype)
-    img_tokens = img_tokens + pos_enc  # broadcasts over B and S
-    img_tokens = img_tokens.permute(0, 2, 1, 3).reshape(B * S, N, D)
+    img_tokens_normed = img_tokens_normed.view(B, N, S, D)
+    pos_enc = temporal_pos_enc(N, frame_interval, hidden_states.device, img_tokens_normed.dtype)
+    img_tokens_normed = img_tokens_normed + pos_enc  # broadcasts over B and S
+    img_tokens_normed = img_tokens_normed.permute(0, 2, 1, 3).reshape(B * S, N, D)
 
     # Reuse the hosting layer's projections (NO new learnable weights).
     proj_dtype = q_proj.weight.dtype
-    img_tokens_proj = img_tokens.to(proj_dtype)
+    img_tokens_proj = img_tokens_normed.to(proj_dtype)
 
     q = q_proj(img_tokens_proj).view(B * S, N, num_heads, head_dim).transpose(1, 2)  # [B*S, Hq, N, hd]
     k = k_proj(img_tokens_proj).view(B * S, N, num_kv_heads, head_dim).transpose(1, 2)  # [B*S, Hkv, N, hd]
